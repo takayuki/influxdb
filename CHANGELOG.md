@@ -4,6 +4,7 @@
 - [#3771](https://github.com/influxdb/influxdb/pull/3771): Close idle Graphite TCP connections
 
 ### Bugfixes
+- [#3785](https://github.com/influxdb/influxdb/issues/3785): Invalid time stamp in graphite metric causes panic
 
 ## v0.9.3 [unreleased]
 
