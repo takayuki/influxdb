@@ -228,20 +228,23 @@ func (lm *SelectMapper) Open() error {
 			}
 
 			tsc := newTagSetCursor(m.Name, t.Tags, cursors, lm.shard.FieldCodec(m.Name))
-			tsc.pointHeap = newPointHeap()
-			//Prime the buffers.
-			for i := 0; i < len(tsc.cursors); i++ {
-				k, v := tsc.cursors[i].SeekTo(lm.queryTMin)
-				if k == -1 {
-					continue
+			if lm.rawMode {
+				tsc.pointHeap = newPointHeap()
+				//Prime the buffers.
+				for i := 0; i < len(tsc.cursors); i++ {
+					k, v := tsc.cursors[i].SeekTo(lm.queryTMin)
+					if k == -1 {
+						continue
+					}
+					p := &pointHeapItem{
+						timestamp: k,
+						value:     v,
+						cursor:    tsc.cursors[i],
+					}
+					heap.Push(tsc.pointHeap, p)
 				}
-				p := &pointHeapItem{
-					timestamp: k,
-					value:     v,
-					cursor:    tsc.cursors[i],
-				}
-				heap.Push(tsc.pointHeap, p)
 			}
+
 			lm.cursors = append(lm.cursors, tsc)
 		}
 		sort.Sort(tagSetCursors(lm.cursors))
@@ -386,8 +389,16 @@ func (lm *SelectMapper) nextChunkAgg() (interface{}, error) {
 			// changes to the mapper functions, which can come later.
 			// Prime the buffers.
 			for i := 0; i < len(tsc.cursors); i++ {
+				ls := tsc.cursors[i].lastSeek
+				// if we've seeked this cursor without calling next and it had
+				// a value outside out time range, don't bother seeking it or
+				// putting it on the heap
+				if tsc.cursors[i].hasSeeked && ls == -1 || (ls != qmin && (ls < qmin || ls >= tmax)) {
+					continue
+				}
 				k, v := tsc.cursors[i].SeekTo(tmin)
-				if k == -1 {
+				// don't bother putting this cursor on the heap if it wont yield a value that we use
+				if k == -1 || (k != qmin && (k < qmin || k >= tmax)) {
 					continue
 				}
 				p := &pointHeapItem{
@@ -766,9 +777,11 @@ func (tsc *tagSetCursor) decodeRawPoint(p *pointHeapItem, selectFields, whereFie
 
 // seriesCursor is a cursor that walks a single series. It provides lookahead functionality.
 type seriesCursor struct {
-	cursor Cursor // BoltDB cursor for a series
-	filter influxql.Expr
-	tags   map[string]string
+	cursor    Cursor // BoltDB cursor for a series
+	filter    influxql.Expr
+	tags      map[string]string
+	lastSeek  int64
+	hasSeeked bool
 }
 
 // newSeriesCursor returns a new instance of a series cursor.
@@ -788,11 +801,14 @@ func (sc *seriesCursor) SeekTo(key int64) (timestamp int64, value []byte) {
 	} else {
 		timestamp, value = int64(btou64(k)), v
 	}
+	sc.hasSeeked = true
+	sc.lastSeek = timestamp
 	return
 }
 
 // Next returns the next timestamp and value from the cursor.
 func (sc *seriesCursor) Next() (key int64, value []byte) {
+	sc.hasSeeked = false
 	k, v := sc.cursor.Next()
 	if k == nil {
 		key = -1
