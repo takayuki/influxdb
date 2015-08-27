@@ -233,7 +233,11 @@ func (w *PointsWriter) writeToShard(shard *meta.ShardInfo, database, retentionPo
 	}
 
 	// response channel for each shard writer go routine
-	ch := make(chan error, len(shard.OwnerIDs))
+	type AsyncWriteResult struct {
+		NodeID uint64
+		Err    error
+	}
+	ch := make(chan *AsyncWriteResult, len(shard.OwnerIDs))
 
 	for _, nodeID := range shard.OwnerIDs {
 		go func(shardID, nodeID uint64, points []tsdb.Point) {
@@ -244,12 +248,12 @@ func (w *PointsWriter) writeToShard(shard *meta.ShardInfo, database, retentionPo
 				if err == tsdb.ErrShardNotFound {
 					err = w.TSDBStore.CreateShard(database, retentionPolicy, shardID)
 					if err != nil {
-						ch <- err
+						ch <- &AsyncWriteResult{nodeID, err}
 						return
 					}
 					err = w.TSDBStore.WriteToShard(shardID, points)
 				}
-				ch <- err
+				ch <- &AsyncWriteResult{nodeID, err}
 				return
 			}
 
@@ -262,11 +266,11 @@ func (w *PointsWriter) writeToShard(shard *meta.ShardInfo, database, retentionPo
 				// be considered a successful write so send nil to the response channel
 				// otherwise, let the original error propogate to the response channel
 				if hherr == nil && consistency == ConsistencyLevelAny {
-					ch <- nil
+					ch <- &AsyncWriteResult{nodeID, nil}
 					return
 				}
 			}
-			ch <- err
+			ch <- &AsyncWriteResult{nodeID, err}
 
 		}(shard.ID, nodeID, points)
 	}
@@ -274,32 +278,32 @@ func (w *PointsWriter) writeToShard(shard *meta.ShardInfo, database, retentionPo
 	var wrote int
 	timeout := time.After(w.WriteTimeout)
 	var writeError error
-	for _, nodeID := range shard.OwnerIDs {
+	for i := 0;  i < len(shard.OwnerIDs); i++ {
 		select {
 		case <-w.closing:
 			return ErrWriteFailed
 		case <-timeout:
 			// return timeout error to caller
 			return ErrTimeout
-		case err := <-ch:
+		case result := <-ch:
 			// If the write returned an error, continue to the next response
-			if err != nil {
-				w.Logger.Printf("write failed for shard %d on node %d: %v", shard.ID, nodeID, err)
+			if result.Err != nil {
+				w.Logger.Printf("write failed for shard %d on node %d: %v", shard.ID, result.NodeID, result.Err)
 
 				// Keep track of the first error we see to return back to the client
 				if writeError == nil {
-					writeError = err
+					writeError = result.Err
 				}
 				continue
 			}
 
 			wrote += 1
-		}
-	}
 
-	// We wrote the required consistency level
-	if wrote >= required {
-		return nil
+			// We wrote the required consistency level
+			if wrote >= required {
+				return nil
+			}
+		}
 	}
 
 	if wrote > 0 {
